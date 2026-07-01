@@ -317,7 +317,8 @@ bool InstalledFileMatchesZipEntry(const std::string& install_dir, const mz_zip_f
   if (!installed_file.exists() || !installed_file.isFile())
     return false;
 
-  if (static_cast<uint64_t>(installed_file.size()) != file_info->uncompressed_size)
+  if (static_cast<uint64_t>(installed_file.size()) !=
+      static_cast<uint64_t>(file_info->uncompressed_size))
     return false;
 
   const std::optional<u32> crc = ComputeFileCRC32(installed_file.absoluteFilePath());
@@ -643,4 +644,3 @@ void InstallUpdateDialog::timerEvent(QTimerEvent *event)
         this->install();
     }
 }
-

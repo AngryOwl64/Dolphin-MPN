@@ -243,15 +243,15 @@ int main(int argc, char* argv[])
   }
   else if (!args.empty())
   {
-    const std::string path = args.front();
+    const std::string game_path = args.front();
     if (options.is_set("netplay_host"))
     {
-      netplay_game = UICommon::GameFile(path);
+      netplay_game = UICommon::GameFile(game_path);
     }
     else
     {
       boot = BootParameters::GenerateFromFile(
-          path, BootSessionData(save_state_path, DeleteSavestateAfterBoot::No));
+          game_path, BootSessionData(save_state_path, DeleteSavestateAfterBoot::No));
       game_specified = true;
     }
   }

@@ -82,6 +82,33 @@ namespace NetPlay
 {
 using namespace WiimoteCommon;
 
+namespace
+{
+std::string ENetAddressToString(const ENetAddress& address)
+{
+  char host_name[64] = {};
+  if (enet_address_get_host_ip(&address, host_name, sizeof(host_name)) == 0)
+    return fmt::format("{}:{}", host_name, address.port);
+
+  return fmt::format("host=0x{:08x}:{}", address.host, address.port);
+}
+
+const char* ENetEventTypeToString(const ENetEventType event_type)
+{
+  switch (event_type)
+  {
+  case ENET_EVENT_TYPE_CONNECT:
+    return "connect";
+  case ENET_EVENT_TYPE_DISCONNECT:
+    return "disconnect";
+  case ENET_EVENT_TYPE_RECEIVE:
+    return "receive";
+  default:
+    return "unknown";
+  }
+}
+}  // namespace
+
 static bool IsSharedControllerPort(const PadMapping& mapping)
 {
   return mapping.players.size() > 1;
@@ -211,6 +238,7 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
   if (!traversal_config.use_traversal)
   {
     // Direct Connection
+    INFO_LOG_FMT(NETPLAY, "Starting direct NetPlay connection: host='{}', port={}.", address, port);
     m_client = enet_host_create(nullptr, 1, CHANNEL_COUNT, 0, 0);
 
     if (m_client == nullptr)
@@ -222,8 +250,16 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
     m_client->mtu = std::min(m_client->mtu, NetPlay::MAX_ENET_MTU);
 
     ENetAddress addr;
-    enet_address_set_host(&addr, address.c_str());
+    addr = {};
+    if (const int resolve_result = enet_address_set_host(&addr, address.c_str()); resolve_result != 0)
+    {
+      ERROR_LOG_FMT(NETPLAY, "Failed to resolve NetPlay host '{}': enet_address_set_host={}.", address,
+                    resolve_result);
+      m_dialog->OnConnectionError(_trans("Could not resolve host."));
+      return;
+    }
     addr.port = port;
+    INFO_LOG_FMT(NETPLAY, "Resolved direct NetPlay host '{}' to {}.", address, ENetAddressToString(addr));
 
     m_server = enet_host_connect(m_client, &addr, CHANNEL_COUNT, 0);
 
@@ -241,6 +277,8 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
     int net = enet_host_service(m_client, &netEvent, 5000);
     if (net > 0 && netEvent.type == ENET_EVENT_TYPE_CONNECT)
     {
+      INFO_LOG_FMT(NETPLAY, "Direct NetPlay socket connected to {}.",
+                   ENetAddressToString(netEvent.peer->address));
       if (Connect())
       {
         m_client->intercept = Common::ENet::InterceptCallback;
@@ -249,7 +287,31 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
     }
     else
     {
-      m_dialog->OnConnectionError(_trans("Could not communicate with host."));
+      if (net == 0)
+      {
+        WARN_LOG_FMT(NETPLAY, "Direct NetPlay connect timed out after 5000ms: host='{}', resolved={}.",
+                     address, ENetAddressToString(addr));
+        m_dialog->OnConnectionError(_trans("Connection timed out while contacting host."));
+      }
+      else if (net < 0)
+      {
+        ERROR_LOG_FMT(NETPLAY,
+                      "enet_host_service failed while connecting to direct NetPlay host '{}': {}.", address,
+                      net);
+        m_dialog->OnConnectionError(_trans("A network error occurred while contacting host."));
+      }
+      else if (netEvent.type == ENET_EVENT_TYPE_DISCONNECT)
+      {
+        WARN_LOG_FMT(NETPLAY, "Direct NetPlay host disconnected during connect attempt: {}.",
+                     ENetAddressToString(netEvent.peer->address));
+        m_dialog->OnConnectionError(_trans("Connection was refused by host."));
+      }
+      else
+      {
+        WARN_LOG_FMT(NETPLAY, "Unexpected ENet event '{}' while connecting to direct NetPlay host '{}'.",
+                     ENetEventTypeToString(netEvent.type), address);
+        m_dialog->OnConnectionError(_trans("Could not communicate with host."));
+      }
     }
   }
   else
@@ -276,6 +338,9 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
     m_traversal_client->m_Client = this;
     m_host_spec = address;
     m_connection_state = ConnectionState::WaitingForTraversalClientConnection;
+    INFO_LOG_FMT(NETPLAY,
+                 "Starting traversal NetPlay connection: host_code='{}', traversal_server='{}:{}'.",
+                 m_host_spec, traversal_config.traversal_host, traversal_config.traversal_port);
     OnTraversalStateChanged();
     m_connecting = true;
 
@@ -295,6 +360,8 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
         {
         case ENET_EVENT_TYPE_CONNECT:
           m_server = netEvent.peer;
+          INFO_LOG_FMT(NETPLAY, "Traversal socket connected to {}.",
+                       ENetAddressToString(m_server->address));
 
           // Update time in milliseconds of no acknowledgment of
           // sent packets before a connection is deemed disconnected
@@ -306,6 +373,11 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
             m_thread = std::thread(&NetPlayClient::ThreadFunc, this);
           }
           return;
+        case ENET_EVENT_TYPE_DISCONNECT:
+          WARN_LOG_FMT(NETPLAY, "Traversal socket disconnected while connecting to host code '{}'.",
+                       m_host_spec);
+          m_connecting = false;
+          break;
         default:
           break;
         }
@@ -313,13 +385,19 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
       if (connect_timer.ElapsedMs() > 5000)
         break;
     }
-    m_dialog->OnConnectionError(_trans("Could not communicate with host."));
+    if (m_connection_state != ConnectionState::Failure)
+    {
+      WARN_LOG_FMT(NETPLAY,
+                   "Traversal NetPlay connection timed out waiting for host '{}' after {}ms (state={}).",
+                   m_host_spec, connect_timer.ElapsedMs(), static_cast<int>(m_connection_state));
+      m_dialog->OnConnectionError(_trans("Connection timed out while contacting host."));
+    }
   }
 }
 
 bool NetPlayClient::Connect()
 {
-  INFO_LOG_FMT(NETPLAY, "Connecting to server.");
+  INFO_LOG_FMT(NETPLAY, "Starting NetPlay handshake.");
 
   // send connect message
   sf::Packet packet;
@@ -341,9 +419,34 @@ bool NetPlayClient::Connect()
   {
     rpac.append(netEvent.packet->data, netEvent.packet->dataLength);
     enet_packet_destroy(netEvent.packet);
+    INFO_LOG_FMT(NETPLAY, "Received NetPlay handshake response from {}.",
+                 ENetAddressToString(m_server->address));
   }
   else
   {
+    if (net == 0)
+    {
+      WARN_LOG_FMT(NETPLAY, "Timed out waiting for NetPlay handshake response from {}.",
+                   ENetAddressToString(m_server->address));
+      m_dialog->OnConnectionError(_trans("Timed out waiting for host handshake."));
+    }
+    else if (net < 0)
+    {
+      ERROR_LOG_FMT(NETPLAY, "enet_host_service failed while waiting for NetPlay handshake: {}.", net);
+      m_dialog->OnConnectionError(_trans("A network error occurred during handshake."));
+    }
+    else if (netEvent.type == ENET_EVENT_TYPE_DISCONNECT)
+    {
+      WARN_LOG_FMT(NETPLAY, "Host disconnected before handshake completed: {}.",
+                   ENetAddressToString(m_server->address));
+      m_dialog->OnConnectionError(_trans("Host disconnected during handshake."));
+    }
+    else
+    {
+      WARN_LOG_FMT(NETPLAY, "Unexpected ENet event '{}' while waiting for handshake.",
+                   ENetEventTypeToString(netEvent.type));
+      m_dialog->OnConnectionError(_trans("Could not communicate with host."));
+    }
     return false;
   }
 
@@ -2273,6 +2376,7 @@ bool NetPlayClient::LocalPlayerOnPad(const PadMapping& mapping) const
 void NetPlayClient::OnTraversalStateChanged()
 {
   const Common::TraversalClient::State state = m_traversal_client->GetState();
+  INFO_LOG_FMT(NETPLAY, "Traversal client state changed to {}.", static_cast<int>(state));
 
   if (m_connection_state == ConnectionState::WaitingForTraversalClientConnection &&
       state == Common::TraversalClient::State::Connected)
@@ -2294,6 +2398,21 @@ void NetPlayClient::OnConnectReady(ENetAddress addr)
 {
   if (m_connection_state == ConnectionState::WaitingForTraversalClientConnectReady)
   {
+    if (addr.port == 0)
+    {
+      // Traversal currently only supports IPv4 for ENet connection endpoints.
+      ERROR_LOG_FMT(NETPLAY,
+                    "Traversal connect-ready endpoint for host '{}' is unsupported (likely IPv6).",
+                    m_host_spec);
+      m_connection_state = ConnectionState::Failure;
+      m_connecting = false;
+      m_dialog->OnConnectionError(
+          _trans("Traversal returned an IPv6 endpoint, but NetPlay currently requires IPv4."));
+      return;
+    }
+
+    INFO_LOG_FMT(NETPLAY, "Traversal connect-ready endpoint for host '{}': {}.", m_host_spec,
+                 ENetAddressToString(addr));
     m_connection_state = ConnectionState::Connecting;
     enet_host_connect(m_client, &addr, CHANNEL_COUNT, 0);
   }
@@ -2304,19 +2423,21 @@ void NetPlayClient::OnConnectFailed(Common::TraversalConnectFailedReason reason)
 {
   m_connecting = false;
   m_connection_state = ConnectionState::Failure;
+  ERROR_LOG_FMT(NETPLAY, "Traversal server failed to connect to host '{}': reason={} (0x{:x}).",
+                m_host_spec, static_cast<int>(reason), static_cast<int>(reason));
   switch (reason)
   {
   case Common::TraversalConnectFailedReason::ClientDidntRespond:
-    PanicAlertFmtT("Traversal server timed out connecting to the host");
+    m_dialog->OnConnectionError(_trans("Traversal server timed out connecting to the host."));
     break;
   case Common::TraversalConnectFailedReason::ClientFailure:
-    PanicAlertFmtT("Server rejected traversal attempt");
+    m_dialog->OnConnectionError(_trans("Host rejected the traversal connection attempt."));
     break;
   case Common::TraversalConnectFailedReason::NoSuchClient:
-    PanicAlertFmtT("Invalid host");
+    m_dialog->OnConnectionError(_trans("Invalid host code."));
     break;
   default:
-    PanicAlertFmtT("Unknown error {0:x}", static_cast<int>(reason));
+    m_dialog->OnConnectionError(_trans("Traversal connection failed with an unknown error."));
     break;
   }
 }

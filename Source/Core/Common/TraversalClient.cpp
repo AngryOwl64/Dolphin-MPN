@@ -72,6 +72,9 @@ static ENetAddress MakeENetAddress(const TraversalInetAddress& address)
   ENetAddress eaddr{};
   if (address.isIPV6)
   {
+    WARN_LOG_FMT(NETPLAY,
+                 "Traversal endpoint uses IPv6 (port {}), but ENet NetPlay currently supports IPv4 only.",
+                 ntohs(address.port));
     eaddr.port = 0;  // no support yet :(
   }
   else
@@ -89,6 +92,7 @@ void TraversalClient::ConnectToClient(std::string_view host)
     PanicAlertFmt("Host too long");
     return;
   }
+  INFO_LOG_FMT(NETPLAY, "Traversal connect request to host code '{}'.", host);
   TraversalPacket packet = {};
   packet.type = TraversalPacketType::ConnectPlease;
   memcpy(packet.connectPlease.hostId.data(), host.data(), host.size());
@@ -207,6 +211,10 @@ void TraversalClient::HandleServerPacket(TraversalPacket* packet)
       break;
 
     m_PendingConnect = false;
+    INFO_LOG_FMT(NETPLAY,
+                 "Traversal connect response for request {}: type={}, is_ipv6={}, port={}.",
+                 packet->connectReady.requestId, static_cast<int>(packet->type),
+                 packet->connectReady.address.isIPV6 != 0, ntohs(packet->connectReady.address.port));
 
     if (!m_Client)
       break;
